@@ -3,31 +3,28 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# --- Configuration & Defaults ---
+# --- 1. SESSION STATE INITIALIZATION ---
+# This block must run before widgets to prevent KeyErrors
 DEFAULTS = {
-    "maf": 0.15,
-    "ld_decay": 0.1,
-    "n_trait1": 100000,
-    "beta_trait1": 0.3,
-    "pos_trait1": 100,
-    "n_trait2": 5000,
-    "beta_trait2": 0.4,
-    "pos_trait2": 100,
+    "maf": 0.15, "ld": 0.1,
+    "n1": 100000, "b1": 0.3, "p1": 100,
+    "n2": 5000, "b2": 0.4, "p2": 100
 }
 
-st.set_page_config(layout="wide")
+for key, val in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
-# --- Simulation Logic ---
-def simulate_locus(n_snps, pos1, pos2, n1, n2, b1, b2, maf, ld_decay):
+# --- 2. SIMULATION ENGINE ---
+def run_simulation(n_snps, pos1, pos2, n1, n2, b1, b2, maf, ld_decay):
     snps = np.arange(n_snps)
 
-    def generate_statistics(causal_idx, true_beta, n_samples, allele_freq):
-        # Standard Error (SE) calculation based on N and MAF
-        # Formula: SE = 1 / sqrt(2 * N * MAF * (1 - MAF))
+    def generate_stats(causal_idx, true_beta, n_samples, allele_freq):
+        # Variance of the estimator based on sample size and allele frequency
+        # Formula derived from 2 * N * MAF * (1-MAF)
         se_val = 1 / np.sqrt(2 * n_samples * allele_freq * (1 - allele_freq))
 
-        # Modeling the association signal across the locus via LD decay
-        # Simulated as an exponential decay from the causal variant
+        # Modeling the regional association tower via exponential LD decay
         base_beta = np.zeros(n_snps)
         base_beta[causal_idx] = true_beta
         for i in range(n_snps):
@@ -35,121 +32,113 @@ def simulate_locus(n_snps, pos1, pos2, n1, n2, b1, b2, maf, ld_decay):
             ld_factor = np.exp(-dist * ld_decay)
             base_beta[i] = base_beta[causal_idx] * ld_factor
 
-        # Sampling distribution: Observed Beta = True Beta + Noise(0, SE)
-        observed_beta = base_beta + np.random.normal(0, se_val, n_snps)
-        observed_se = np.full(n_snps, se_val)
-        return observed_beta, observed_se
+        # Observed Beta = True Effect + Sampling Error
+        obs_beta = base_beta + np.random.normal(0, se_val, n_snps)
+        obs_se = np.full(n_snps, se_val)
+        return obs_beta, obs_se
 
-    b1_obs, se1_obs = generate_statistics(pos1, b1, n1, maf)
-    b2_obs, se2_obs = generate_statistics(pos2, b2, n2, maf)
-    return snps, b1_obs, b2_obs, se1_obs, se2_obs
+    b1_s, se1_s = generate_stats(pos1, b1, n1, maf)
+    b2_s, se2_s = generate_stats(pos2, b2, n2, maf)
+    return snps, b1_s, b2_s, se1_s, se2_s
 
-# --- Colocalization Engine ---
-def compute_coloc_posteriors(b1, se1, b2, se2):
-    # Log-space Approximate Bayes Factor (ABF) for numerical stability
+# --- 3. NUMERICALLY STABLE COLOC ENGINE ---
+def compute_posteriors(b1, se1, b2, se2):
+    # Log-transforming ABF prevents numerical overflow (NaNs)
     def get_log_abf(beta, se):
-        v, w = se**2, 0.15**2 # Prior variance W fixed at 0.15^2
+        v, w = se**2, 0.15**2
         r = w / (w + v)
         z_sq = (beta/se)**2
         return 0.5 * (np.log(1 - r) + (z_sq * r))
 
-    labf1 = get_log_abf(b1, se1)
-    labf2 = get_log_abf(b2, se2)
+    l_abf1 = get_log_abf(b1, se1)
+    l_abf2 = get_log_abf(b2, se2)
 
-    # Prior probabilities
-    # p1: variant causal for trait 1
-    # p2: variant causal for trait 2
-    # p12: variant causal for both (shared)
+    # Priors for H1, H2 (1e-4) and H4 (1e-5)
     lp1, lp2, lp12 = np.log(1e-4), np.log(1e-4), np.log(1e-5)
 
+    # Log-Sum-Exp Trick for computational stability
     def logsum(l_vec):
         m = np.max(l_vec)
         return m + np.log(np.sum(np.exp(l_vec - m)))
 
-    # Aggregate log-probabilities for the five hypotheses
-    lH0 = 0 # Null hypothesis
-    lH1 = lp1 + logsum(labf1)
-    lH2 = lp2 + logsum(labf2)
-    lH3 = lp1 + lp2 + logsum(labf1[:, None] + labf2[None, :])
-    lH4 = lp12 + logsum(labf1 + labf2)
+    lH0 = 0
+    lH1 = lp1 + logsum(l_abf1)
+    lH2 = lp2 + logsum(l_abf2)
+    lH3 = lp1 + lp2 + logsum(l_abf1[:, None] + l_abf2[None, :])
+    lH4 = lp12 + logsum(l_abf1 + l_abf2)
 
     l_all = np.array([lH0, lH1, lH2, lH3, lH4])
-    post_probs = np.exp(l_all - logsum(l_all))
+    probs = np.exp(l_all - logsum(l_all))
+    return probs
 
-    return {"H0": post_probs[0], "H1": post_probs[1],
-            "H2": post_probs[2], "H3": post_probs[3], "H4": post_probs[4]}
-
-# --- Sidebar Interface ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
-    st.header("Simulation Parameters")
+    st.header("Simulation Settings")
 
-    if st.button("Reset to Defaults"):
+    if st.button("Reset Parameters"):
         for key, val in DEFAULTS.items():
             st.session_state[key] = val
+        st.rerun()
 
-    st.subheader("Population Genetics")
-    maf = st.slider("Minor Allele Frequency (MAF)", 0.01, 0.50, key="maf", value=DEFAULTS["maf"])
-    ld_decay = st.slider("LD Decay Rate", 0.01, 0.5, key="ld_decay", value=DEFAULTS["ld_decay"])
-
-    st.divider()
-    st.subheader("Trait 1 Statistics (GWAS)")
-    n1 = st.number_input("Sample Size (N1)", 1000, 1000000, key="n1", value=DEFAULTS["n1"])
-    beta1 = st.slider("Causal Effect (Beta1)", -1.0, 1.0, key="beta1", value=DEFAULTS["beta1"])
-    pos1 = st.slider("Causal Position 1", 0, 200, key="pos1", value=DEFAULTS["pos1"])
+    st.subheader("Regional Context")
+    maf = st.slider("Minor Allele Frequency (MAF)", 0.01, 0.5, key="maf")
+    ld = st.slider("LD Decay Rate", 0.01, 0.5, key="ld")
 
     st.divider()
-    st.subheader("Trait 2 Statistics (Molecular QTL)")
-    n2 = st.number_input("Sample Size (N2)", 100, 100000, key="n2", value=DEFAULTS["n2"])
-    beta2 = st.slider("Causal Effect (Beta2)", -1.0, 1.0, key="beta2", value=DEFAULTS["beta2"])
-    pos2 = st.slider("Causal Position 2", 0, 200, key="pos2", value=DEFAULTS["pos2"])
+    st.subheader("Trait 1 (Large Cohort)")
+    n1 = st.number_input("Sample Size (N1)", 1000, 1000000, key="n1")
+    beta1 = st.slider("Causal Effect (Beta 1)", -1.0, 1.0, key="b1")
+    pos1 = st.slider("Causal SNP Index (A)", 0, 200, key="p1")
 
-# Execution
-snps, b1_s, b2_s, se1_s, se2_s = simulate_locus(200, pos1, pos2, n1, n2, beta1, beta2, maf, ld_decay)
-probs = compute_coloc_posteriors(b1_s, se1_s, b2_s, se2_s)
+    st.divider()
+    st.subheader("Trait 2 (Small Cohort)")
+    n2 = st.number_input("Sample Size (N2)", 100, 100000, key="n2")
+    beta2 = st.slider("Causal Effect (Beta 2)", -1.0, 1.0, key="b2")
+    pos2 = st.slider("Causal SNP Index (B)", 0, 200, key="p2")
 
-# --- Main Results Display ---
-st.title("Bayesian Colocalization Simulation")
-st.markdown("""
-This tool simulates summary statistics for two traits to evaluate the posterior probability
-of shared versus independent causal variants within a single genomic locus.
-""")
+# --- 5. EXECUTION & OUTPUT ---
+snps, b1_obs, b2_obs, se1_obs, se2_obs = run_simulation(200, pos1, pos2, n1, n2, beta1, beta2, maf, ld)
+post_probs = compute_posteriors(b1_obs, se1_obs, b2_obs, se2_obs)
 
-col_plt, col_res = st.columns([2, 1])
+st.title("Bayesian Colocalization Analysis")
+st.markdown("Analysis of shared versus independent causal variants within a genomic locus.")
 
-with col_plt:
+col_viz, col_data = st.columns([2, 1])
+
+with col_viz:
     fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
-    # Approximation of -log10P for visualization purposes
-    lp1 = (b1_s**2 / (se1_s**2 * 2)) / np.log(10)
-    lp2 = (b2_s**2 / (se2_s**2 * 2)) / np.log(10)
+    # Approximation of -log10P
+    lp1 = (b1_obs**2 / (se1_obs**2 * 2)) / np.log(10)
+    lp2 = (b2_obs**2 / (se2_obs**2 * 2)) / np.log(10)
 
-    ax1.scatter(snps, lp1, c=lp1, cmap='winter', s=30, edgecolors='none')
+    ax1.scatter(snps, lp1, c=lp1, cmap='winter', s=30)
     ax1.set_ylabel("Trait 1 (-log10P)")
-    ax2.scatter(snps, lp2, c=lp2, cmap='autumn', s=30, edgecolors='none')
+    ax2.scatter(snps, lp2, c=lp2, cmap='autumn', s=30)
     ax2.set_ylabel("Trait 2 (-log10P)")
-    ax2.set_xlabel("SNP Index")
+    ax2.set_xlabel("Genomic Position (SNP Index)")
     st.pyplot(fig)
 
-with col_res:
+with col_data:
     st.subheader("Posterior Probabilities")
-    for h, p in probs.items():
-        st.write(f"**{h}:** {p:.2%}")
-        st.progress(float(np.clip(p, 0.0, 1.0)))
+    h_labels = ["H0 (Null)", "H1 (Trait 1 Only)", "H2 (Trait 2 Only)", "H3 (Linkage/Indep)", "H4 (Shared/Coloc)"]
+    for i, p in enumerate(post_probs):
+        # Clamping value to [0.0, 1.0] to satisfy st.progress()
+        safe_p = float(np.clip(p, 0.0, 1.0))
+        st.write(f"**{h_labels[i]}:** {safe_p:.2%}")
+        st.progress(safe_p)
 
-# --- Documentation ---
+# --- 6. STATISTICAL DOCUMENTATION ---
 st.divider()
-st.header("Statistical Documentation")
+st.header("Assay Mechanics")
+
 
 st.markdown("""
-### Hypothesis Definitions
-Colocalization analysis evaluates five mutually exclusive hypotheses regarding the causal architecture of a locus:
-* **H0**: No causal variant for either trait.
-* **H1**: Causal variant for Trait 1 only.
-* **H2**: Causal variant for Trait 2 only.
-* **H3**: Independent causal variants for each trait (Linkage Disequilibrium).
-* **H4**: Shared causal variant for both traits (Colocalization).
+### Variable Determinants
+* **Sample Size (N):** Determines the Standard Error ($SE$). If $N$ is too small, the Bayesian engine cannot distinguish a true signal from background noise ($H0$).
+* **Minor Allele Frequency (MAF):** Modulates statistical precision. Low-frequency variants require exponentially larger sample sizes to reach the same evidence threshold as common variants.
+* **LD Decay:** Controls the regional correlation structure. Lower decay rates create broader association blocks, making it statistically difficult to distinguish $H3$ (Linkage) from $H4$ (Colocalization).
 
-### Key Determinants of H4
-1. **Sample Size (N) and SE**: Precision is determined by $SE = 1/\sqrt{2N \cdot MAF(1-MAF)}$. If $N$ is insufficient, the Bayes Factor cannot overcome the prior penalty for $H4$ ($10^{-5}$), often resulting in a high $H0$ or $H1$ probability despite apparent peak overlap.
-2. **Positional Congruence**: The core of the $H4$ calculation is $\sum (ABF_{i,1} \times ABF_{i,2})$. Even a minor shift in causal position between traits will increase the evidence for $H3$ as the product of Bayes Factors for the top SNPs will decrease.
-3. **Directionality**: Colocalization as implemented via ABF is agnostic to the sign of the effect size ($\beta$). It identifies a shared causal *locus*, but does not infer the causal *direction* between traits.
+### Hypothesis Logic
+The posterior for $H4$ (Colocalization) is derived from the product of the Approximate Bayes Factors across all SNPs in the region.
+If the peak association for Trait 1 and Trait 2 occurs at the same SNP, the product of their individual Bayes Factors increases exponentially, driving the $H4$ posterior toward 1.0.
 """)
